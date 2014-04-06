@@ -1,0 +1,570 @@
+diff --git a/arch/x86/syscalls/syscall_64.tbl b/arch/x86/syscalls/syscall_64.tbl
+index a582bfe..f9b7f79 100644
+--- a/arch/x86/syscalls/syscall_64.tbl
++++ b/arch/x86/syscalls/syscall_64.tbl
+@@ -319,7 +319,7 @@
+ 310	64	process_vm_readv	sys_process_vm_readv
+ 311	64	process_vm_writev	sys_process_vm_writev
+ 312	common	kcmp			sys_kcmp
+-
++313	common	segmap			sys_segmap
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+ # for native 64-bit operation.
+diff --git a/include/linux/mman.h b/include/linux/mman.h
+index d09dde1..4cc9cd6 100644
+--- a/include/linux/mman.h
++++ b/include/linux/mman.h
+@@ -78,5 +78,9 @@ calc_vm_flag_bits(unsigned long flags)
+ 	return _calc_vm_trans(flags, MAP_GROWSDOWN,  VM_GROWSDOWN ) |
+ 	       _calc_vm_trans(flags, MAP_DENYWRITE,  VM_DENYWRITE ) |
+ 	       _calc_vm_trans(flags, MAP_LOCKED,     VM_LOCKED    );
++
+ }
++unsigned long segmap_map_region(struct task_struct *tsk,struct file *file,unsigned long addr,unsigned long len,unsigned long flags,
++				vm_flags_t vm_flags,unsigned long offset);
++
+ #endif /* _LINUX_MMAN_H */
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 2d8927f..5993225 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -72,6 +72,9 @@
+ #include <linux/slab.h>
+ #include <linux/init_task.h>
+ #include <linux/binfmts.h>
++#include <linux/mman.h>
++#include <linux/fdtable.h>
++#include <linux/security.h>
+ 
+ #include <asm/switch_to.h>
+ #include <asm/tlb.h>
+@@ -3607,6 +3610,290 @@ SYSCALL_DEFINE1(nice, int, increment)
+ }
+ 
+ #endif
++spinlock_t segmap_slock;
++rwlock_t segmap_rwlock;
++struct vm vm[SEGMAP_MAX_VMA];
++unsigned long *state=NULL;
++
++/* it's a mmap-like implementation */
++unsigned long  segmap_insert_vm(struct task_struct *tsk,struct segmap *segmap,unsigned long *nr)
++{
++	unsigned long ret = 0;
++	struct file *file = NULL;
++	struct mmap_arg_struct ms;
++	unsigned long (*get_area)(struct file*,unsigned long ,unsigned long,unsigned long,unsigned long);
++	struct mm_struct *mm = get_task_mm(tsk);
++	vm_flags_t vmflags;
++	struct inode *inode;
++	unsigned long vma_count;
++		
++	if(!state) {
++		return -EINVAL;
++	}
++
++	if(!access_ok(VERIFY_WRITE,nr,sizeof(nr))) {
++		ret = -EINVAL;
++		goto out;
++	}
++	ms = segmap->mmap;
++
++	rcu_read_lock();
++	file = fcheck_files(tsk->files,ms.fd);
++	rcu_read_unlock();
++	
++	if(!ms.len)
++		return -EINVAL;
++	
++	if(ms.len > TASK_SIZE || PAGE_ALIGN(ms.len) > TASK_SIZE)
++		return -ENOMEM;
++	
++	ms.len = PAGE_ALIGN(ms.len);
++	if(!ms.len)
++		return -ENOMEM;
++	
++	if((ms.offset + (ms.len >> PAGE_SHIFT)) < ms.offset)
++		return -EOVERFLOW;
++	
++	if(mm->map_count > sysctl_max_map_count)
++		return -ENOMEM;
++	
++	if(!(ms.flags & MAP_FIXED)) {
++		unsigned long hint = ms.addr;
++		hint &= PAGE_MASK;
++		
++		if(((void*)hint != NULL) && (hint < mmap_min_addr))
++			ms.addr = PAGE_ALIGN(mmap_min_addr);
++		else
++			ms.addr = hint;
++	}
++	
++	
++	/* get unmapped area , I should re-implement it since it returns 
++	   only addr from current process */
++	get_area = mm->get_unmapped_area;
++	if(file && file->f_op && file->f_op->get_unmapped_area)
++		get_area = file->f_op->get_unmapped_area;
++
++	ms.addr = get_area(file,ms.addr,ms.len,ms.offset,ms.flags);
++
++	printk(KERN_INFO "task_size : %lx\n",TASK_SIZE);
++	printk(KERN_INFO "task_size : %lx\n",ms.addr +ms.len);
++	if((ms.addr +ms.len) > TASK_SIZE) {
++		*state = get_nr_vma(tsk);
++		return -ENOMEM;
++	}
++	
++
++	ret = security_mmap_addr(ms.addr);
++	if(ret) 
++		return ret;
++	
++	if(ms.addr & ~PAGE_MASK)
++		return ms.addr;
++
++	/* compute the flags of the new memory region */
++	vmflags = calc_vm_prot_bits(ms.prot) |
++		calc_vm_flag_bits(ms.flags) |
++		mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
++	
++	
++
++	inode = file ? file->f_path.dentry->d_inode : NULL;
++	if(file) {
++		switch(ms.flags & MAP_TYPE) {
++		case MAP_SHARED:
++			if((ms.prot & PROT_WRITE) && (file->f_mode & FMODE_WRITE))
++				return -EACCES;
++			vmflags |= VM_SHARED |VM_MAYSHARE;
++			if(!(file->f_mode & FMODE_WRITE))
++				vmflags &= ~(VM_MAYWRITE | VM_SHARED);
++			
++			
++		case MAP_PRIVATE:
++			if(!(file->f_mode & FMODE_READ))
++				return -EACCES;
++			if(!file->f_op || !file->f_op->mmap)
++				return -ENODEV;
++			break;
++		default:
++			return -EINVAL;
++			
++		}
++	}
++	else {
++		switch(ms.flags & MAP_TYPE) {
++		case MAP_SHARED:
++			ms.offset = 0;
++			vmflags |= VM_SHARED | VM_MAYSHARE;
++			break;
++		case MAP_PRIVATE:
++			ms.offset = ms.offset >> PAGE_SHIFT;
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++	/* let's map a region now !
++	 * it sucks here :|
++	 */
++	ret = segmap_map_region(tsk,file,ms.addr,ms.len,ms.flags,vmflags,ms.offset);
++out:	
++	return ret;
++	
++	
++}
++int  segmap_get_sections(struct task_struct *tsk,struct segmap *segmap,unsigned long *nr)
++{
++	int nr_vma,vma_i;
++	int ret=0;
++	int alloc;
++	struct vm_area_struct *vma;
++		
++	alloc = 0;
++
++	if(get_task_cred(current)->uid != get_task_cred(tsk)->uid ||
++	   get_task_cred(current)->gid != get_task_cred(tsk)->gid ) {
++		ret = -EPERM;
++		goto out;
++	}
++		
++
++	write_lock(&segmap_rwlock);   
++	memset(vm,0,sizeof(struct vm)*SEGMAP_MAX_VMA);
++	nr_vma = get_nr_vma(tsk);
++	if (nr_vma >= SEGMAP_MAX_VMA || !nr_vma) {
++		ret = -EINVAL;
++		goto out;
++	}
++	
++	if(nr)
++		put_user(nr_vma,nr);
++	
++	segmap->sm_pid = tsk->pid;
++	get_task_comm(segmap->sm_comm,tsk);
++
++	segmap->sm_stack = tsk->mm->start_stack;
++	segmap->sm_start_code = tsk->mm->start_code;
++	segmap->sm_end_code = tsk->mm->end_code;
++	segmap->sm_start_data = tsk->mm->start_data;
++	segmap->sm_end_data = tsk->mm->end_data;
++	segmap->sm_nr_vma = nr_vma;
++	
++	vma_i = 0;
++	for_each_vma(vma,tsk) {
++		vm[vma_i].vm_start = vma->vm_start;
++		vm[vma_i].vm_end = vma->vm_end;
++		vma_i++;
++		
++		if ( vma_i >=(nr_vma +1)) {
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++	
++	
++	memcpy(segmap->sm_vm,vm,(nr_vma+1)*sizeof(struct vm));
++
++
++
++out:
++	write_unlock(&segmap_rwlock);	
++
++	
++	return ret;
++}
++
++int segmap_remove_vm(struct task_struct *tsk,struct segmap *segmap)
++{
++	int ret;
++	struct mm_struct *mm = tsk->mm;
++	
++	down_write(&mm->mmap_sem);
++	ret = do_munmap(mm,segmap->mmap.addr,segmap->mmap.len);
++	up_write(&mm->mmap_sem);
++	return ret;
++}
++
++SYSCALL_DEFINE4(segmap, pid_t , upid, struct segmap __user *,s_map,unsigned long __user *, nr, int , flags)
++{
++	int ret=0;
++	pid_t pid;
++	struct task_struct *tsk;
++	struct pid *pid_struct;
++	struct segmap *segmap;
++	
++	rwlock_init(&segmap_rwlock);
++	spin_lock_init(&segmap_slock);
++
++	rcu_read_lock();
++	
++	pid = upid;
++	pid_struct = find_get_pid(pid);
++
++	if(!pid_struct) {
++		ret =  -EINVAL;
++		goto out;
++	}
++
++	tsk = pid_task(pid_struct ,PIDTYPE_PID);
++	if(!tsk) {
++		ret = -EINVAL;
++		goto out;
++	}
++	segmap = kmalloc(sizeof(struct segmap),GFP_KERNEL);
++	if(!segmap) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	
++	rcu_read_unlock();
++
++	switch(flags & SEGMAP_MASK) {
++		
++	case SEGMAP_FETCH:
++		ret = segmap_get_sections(tsk,segmap,nr);
++		if(ret) {
++			goto out;
++		}
++		state = nr;
++		if(copy_to_user(s_map,segmap,sizeof(struct segmap))) {
++			ret = -EFAULT;
++			goto out;
++		}
++		
++		break;
++		
++	case SEGMAP_INSERT:
++		if(nr) {
++			if(!access_ok(VERIFY_WRITE,nr,sizeof(nr))) {
++				ret = -EINVAL;
++				goto out;
++			}
++		}
++
++		if(copy_from_user(segmap,s_map,sizeof(struct segmap))) {
++			ret = -EFAULT;
++			goto out;
++		}
++		
++		ret = segmap_insert_vm(tsk,segmap,nr);
++		goto out;
++		
++	       
++	case SEGMAP_REMOVE:
++		return segmap_remove_vm(tsk,segmap);
++		
++		
++	default:
++		ret = -EINVAL;
++		goto out;
++	}
++	
++out:
++	
++	rcu_read_lock();
++	return ret;
++}
+ 
+ /**
+  * task_prio - return the priority value of a given task.
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 7a7db09..e74c05a 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -3,7 +3,7 @@
+ #include <linux/mutex.h>
+ #include <linux/spinlock.h>
+ #include <linux/stop_machine.h>
+-
++#include <linux/security.h>
+ #include "cpupri.h"
+ 
+ extern __read_mostly int scheduler_running;
+@@ -34,6 +34,14 @@ extern __read_mostly int scheduler_running;
+ #define NICE_0_LOAD		SCHED_LOAD_SCALE
+ #define NICE_0_SHIFT		SCHED_LOAD_SHIFT
+ 
++
++#define SEGMAP_FETCH		1
++#define SEGMAP_INSERT		2
++#define SEGMAP_REMOVE		4
++#define SEGMAP_GET_NR		8
++#define SEGMAP_MASK		15
++
++
+ /*
+  * These are the 'tuning knobs' of the scheduler:
+  */
+@@ -478,6 +486,82 @@ static inline int cpu_of(struct rq *rq)
+ #endif
+ }
+ 
++#define SEGMAP_MAX_VMA		128
++
++struct mmap_arg_struct {
++	unsigned long addr;
++	unsigned long len;
++	unsigned long prot;
++	unsigned long flags;
++	unsigned long fd;
++	unsigned long offset;
++};
++
++struct segmap {
++	pid_t sm_pid;
++	char sm_comm[16];
++	struct  {
++		unsigned long start_code,end_code;
++		unsigned long start_data,end_data;
++		unsigned long stack;
++		int nr_vma;
++		struct vm {
++			unsigned long vm_start,vm_end;
++		}vm[SEGMAP_MAX_VMA];			/* used to hold other memory allocations
++							 * BSS section,dynamically allocated chunks ... etc */
++	}pmem;						/* Process memory holder*/
++	struct mmap_arg_struct mmap;
++/* Some Macro facilities */
++#define sm_vm			pmem.vm
++#define sm_start_code		pmem.start_code
++#define sm_end_code		pmem.end_code
++#define sm_start_data		pmem.start_data
++#define sm_end_data		pmem.end_data
++#define sm_stack		pmem.stack
++#define sm_nr_vma		pmem.nr_vma
++#define sm_vm_vmstart		sm_vm.vm_start
++#define sm_vm_vmend		sm_vm.vm_end
++#define sm_vm_vmnext		sm_vm.next
++
++};
++
++struct vm_t {
++	unsigned long vm_start,vm_end;
++};
++
++#define for_each_vma(vma,task)		\
++	for((vma)=(task)->mm->mmap;(vma);(vma)=(vma)->vm_next) 
++
++static inline int get_nr_vma(struct task_struct *task)
++{
++	struct mm_struct *mm;
++	
++	task_lock(task);
++	
++	/* Kernel thread (usually) doesn't have any memory descriptor
++	 * its stack is referenced by CPU registers (rbp and ss)
++	 * but who cares ! 
++	 */
++	mm = task->mm;
++	if(mm) {
++		if(task->flags & PF_KTHREAD) {
++			mm = NULL;
++			task_unlock(task);
++			return 0;
++		}
++		else
++			atomic_inc(&mm->mm_users);
++	}
++	else {
++		task_unlock(task);
++		return 0;
++	}
++	
++	task_unlock(task);
++	return get_task_mm(task)->map_count;
++}
++
++
+ DECLARE_PER_CPU(struct rq, runqueues);
+ 
+ #define cpu_rq(cpu)		(&per_cpu(runqueues, (cpu)))
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 9a796c4..747e016 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2717,6 +2717,122 @@ void mm_drop_all_locks(struct mm_struct *mm)
+ 	mutex_unlock(&mm_all_locks_mutex);
+ }
+ 
++unsigned long segmap_map_region(struct task_struct *tsk,struct file *file,unsigned long addr,unsigned long len,unsigned long flags,
++				vm_flags_t vm_flags,unsigned long offset)
++{
++	struct mm_struct *mm = tsk->mm;
++	struct vm_area_struct *vma, *prev;
++	int correct_wcount = 0;
++	int error;
++	struct rb_node **rb_link, *rb_parent;
++	unsigned long charged = 0;
++	struct inode *inode =  file ? file->f_path.dentry->d_inode : NULL;
++	unsigned long pgoff  = offset;
++
++	/* Clear old maps */
++	error = -ENOMEM;
++
++	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link, &rb_parent)) {
++		if (do_munmap(mm, addr, len))
++			return -ENOMEM;
++	}
++
++	/* Check against address space limit. */
++	if( (mm->total_vm+(len >> PAGE_SHIFT)) > ACCESS_ONCE(tsk->signal->rlim[RLIMIT_AS].rlim_cur)) 
++		return -ENOMEM;
++
++	vma = vma_merge(mm, prev, addr, addr + len, vm_flags, NULL, file, pgoff, NULL);
++	if (vma)
++		goto out;
++
++	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
++	if (!vma) {
++		error = -ENOMEM;
++		goto unacct_error;
++	}
++
++	vma->vm_mm = mm;
++	vma->vm_start = addr;
++	vma->vm_end = addr + len;
++	vma->vm_flags = vm_flags;
++	vma->vm_page_prot = vm_get_page_prot(vm_flags);
++	vma->vm_pgoff = pgoff;
++	INIT_LIST_HEAD(&vma->anon_vma_chain);
++
++	error = -EINVAL;	
++
++	if (file) {
++		if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
++			goto free_vma;
++		
++		if (vm_flags & VM_DENYWRITE) {
++			error = deny_write_access(file);
++			if (error)
++				goto free_vma;
++			correct_wcount = 1;
++		}
++		vma->vm_file = get_file(file);
++		error = file->f_op->mmap(file, vma);
++		if (error)
++			goto unmap_and_free_vma;
++		
++		addr = vma->vm_start;
++		pgoff = vma->vm_pgoff;
++		vm_flags = vma->vm_flags;
++	} else if (vm_flags & VM_SHARED) {
++		if (unlikely(vm_flags & (VM_GROWSDOWN|VM_GROWSUP)))
++			goto free_vma;
++		error = shmem_zero_setup(vma);
++		if (error)
++			goto free_vma;
++	}
++	if (vma_wants_writenotify(vma)) {
++		pgprot_t pprot = vma->vm_page_prot;
++
++		vma->vm_page_prot = vm_get_page_prot(vm_flags & ~VM_SHARED);
++		if (pgprot_val(pprot) == pgprot_val(pgprot_noncached(pprot)))
++			vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++	}
++
++
++	vma_link(mm, vma, prev, rb_link, rb_parent);
++	file = vma->vm_file;
++
++
++	if (correct_wcount)
++		atomic_inc(&inode->i_writecount);
++out:
++	perf_event_mmap(vma);
++
++	vm_stat_account(mm, vm_flags, file, len >> PAGE_SHIFT);
++	if (vm_flags & VM_LOCKED) {
++		if (!mlock_vma_pages_range(vma, addr, addr + len))
++			mm->locked_vm += (len >> PAGE_SHIFT);
++	} else if ((flags & MAP_POPULATE) && !(flags & MAP_NONBLOCK))
++		make_pages_present(addr, addr + len);
++
++	if (file)
++		uprobe_mmap(vma);
++
++	return addr;
++
++unmap_and_free_vma:
++	if (correct_wcount)
++		atomic_inc(&inode->i_writecount);
++	vma->vm_file = NULL;
++	fput(file);
++
++	unmap_region(mm, vma, prev, vma->vm_start, vma->vm_end);
++	charged = 0;
++free_vma:
++	kmem_cache_free(vm_area_cachep, vma);
++unacct_error:
++	if (charged)
++		vm_unacct_memory(charged);
++	return error;
++
++	
++}
+ /*
+  * initialise the VMA slab
+  */
